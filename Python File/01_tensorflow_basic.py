@@ -1,91 +1,203 @@
-# coding=utf-8
+"""Simple image classification with Inception.
+Run image classification with Inception trained on ImageNet 2012 Challenge data
+set.
+This program creates a graph from a saved GraphDef protocol buffer,
+and runs inference on an input JPEG image. It outputs human readable
+strings of the top 5 predictions along with their probabilities.
+Change the --image_file argument to any jpg image to compute a
+classification of that image.
+Please see the tutorial and website for a detailed description of how
+to use this script to perform image recognition.
+https://tensorflow.org/tutorials/image_recognition/
+"""
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import argparse
+import os.path
+import re
+import sys
+import tarfile
+
 import numpy as np
+from six.moves import urllib
 import tensorflow as tf
-import pandas as pd
-from sklearn.model_selection import train_test_split
 
-train_path = '/Users/sephiroth/Documents/ML_TensorFlow/Data Source/train.csv'
-test_path = "/Users/sephiroth/Documents/ML_TensorFlow/Data Source/test.csv"
-model_path = "/Users/sephiroth/Documents/ML_TensorFlow/Data Model/model.ckpt"
+FLAGS = None
 
-v1 = tf.Variable(tf.zeros([200]))
-saver = tf.train.Saver()
-v2 = tf.Variable(tf.ones([100]))
-
-# 读取训练数据
-data = pd.read_csv(train_path)
-# 取部分特征字段用于分类，并将所有却是的字段设为 0
-data['Sex'] = data['Sex'].apply(lambda s: 1 if s == 'male' else 0)
-data = data.fillna(0)
-dataset_X = data[['Sex', 'Age', 'Pclass', 'SibSp', 'Parch', 'Fare']]
-dataset_X = dataset_X.as_matrix()
-
-# 两种分类分别是幸存和死亡，'Survived' 字段是其中一种分类的标签
-# 新添 'Deceased' 字段表示第二种分类的标签，取值为 'Survived' 字段取非
-data['Deceased'] = data['Survived'].apply(lambda s: int(not s))
-dataset_Y = data[['Deceased', 'Survived']]
-dataset_Y = dataset_Y.as_matrix()
-
-X_train, X_test, Y_train, Y_test = train_test_split(dataset_X, dataset_Y, test_size=0.2,
-                                                    random_state=42)
-# 声明输入的占位符
-# shape 参数的第一个元素为 None，表示可以同时放入任意条记录
-X = tf.placeholder(tf.float32, shape=[None, 6])
-Y = tf.placeholder(tf.float32, shape=[None, 2])
-
-# 声明变量，使用逻辑回归算法
-W = tf.Variable(tf.random_normal([6, 2]), name='weights')
-b = tf.Variable(tf.zeros([2]), name='bias')
-Y_pred = tf.nn.softmax(tf.matmul(X, W) + b)
-
-# 使用交叉熵作为代价函数
-cross_entropy = - tf.reduce_sum(Y * tf.log(Y_pred + 1e-10), reduction_indices=1)
-cost = tf.reduce_mean(cross_entropy)
-
-# 使用随机梯度下降算法优化器来最小化代价，系统自动构建反向传播部分的计算图
-train_op = tf.train.GradientDescentOptimizer(0.001).minimize(cost)
-
-with tf.Session() as sess:
-    # 初始化所有变量，必须最想执行
-    tf.global_variables_initializer().run()
-
-    # 训练迭代10轮
-    for epoch in range(10):
-        total_loss = 0
-        for i in range(len(X_train)):
-            feed = {X: [X_train[i]], Y: [Y_train[i]]}
-            # 通过 session.run 接口触发执行
-            _, loss = sess.run([train_op, cost], feed_dict=feed)
-            total_loss += loss
-        print ("Epoch: %04d, total loss = %.9f" % (epoch + 1, total_loss))
-        # 评估校验数据集上的准确率
-        pred = sess.run(Y_pred, feed_dict={X: X_test})
-        correct = np.equal(np.argmax(pred, 1), np.argmax(Y_test, 1))
-        accuracy = np.mean(correct.astype(np.float32))
-    print("Accuracy on validation set: %.9f" % accuracy)
-    save_path = saver.save(sess, model_path)
-    print ('Training complete')
+# pylint: disable=line-too-long
+DATA_URL = 'http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz'
+# pylint: enable=line-too-long
 
 
+class NodeLookup(object):
+  """Converts integer node ID's to human readable labels."""
+
+  def __init__(self,
+               label_lookup_path=None,
+               uid_lookup_path=None):
+    if not label_lookup_path:
+      label_lookup_path = os.path.join(
+          FLAGS.model_dir, 'imagenet_2012_challenge_label_map_proto.pbtxt')
+    if not uid_lookup_path:
+      uid_lookup_path = os.path.join(
+          FLAGS.model_dir, 'imagenet_synset_to_human_label_map.txt')
+    self.node_lookup = self.load(label_lookup_path, uid_lookup_path)
+
+  def load(self, label_lookup_path, uid_lookup_path):
+    """Loads a human readable English name for each softmax node.
+    Args:
+      label_lookup_path: string UID to integer node ID.
+      uid_lookup_path: string UID to human-readable string.
+    Returns:
+      dict from integer node ID to human-readable string.
+    """
+    if not tf.gfile.Exists(uid_lookup_path):
+      tf.logging.fatal('File does not exist %s', uid_lookup_path)
+    if not tf.gfile.Exists(label_lookup_path):
+      tf.logging.fatal('File does not exist %s', label_lookup_path)
+
+    # Loads mapping from string UID to human-readable string
+    proto_as_ascii_lines = tf.gfile.GFile(uid_lookup_path).readlines()
+    uid_to_human = {}
+    p = re.compile(r'[n\d]*[ \S,]*')
+    for line in proto_as_ascii_lines:
+      parsed_items = p.findall(line)
+      uid = parsed_items[0]
+      human_string = parsed_items[2]
+      uid_to_human[uid] = human_string
+
+    # Loads mapping from string UID to integer node ID.
+    node_id_to_uid = {}
+    proto_as_ascii = tf.gfile.GFile(label_lookup_path).readlines()
+    for line in proto_as_ascii:
+      if line.startswith('  target_class:'):
+        target_class = int(line.split(': ')[1])
+      if line.startswith('  target_class_string:'):
+        target_class_string = line.split(': ')[1]
+        node_id_to_uid[target_class] = target_class_string[1:-2]
+
+    # Loads the final mapping of integer node ID to human-readable string
+    node_id_to_name = {}
+    for key, val in node_id_to_uid.items():
+      if val not in uid_to_human:
+        tf.logging.fatal('Failed to locate: %s', val)
+      name = uid_to_human[val]
+      node_id_to_name[key] = name
+
+    return node_id_to_name
+
+  def id_to_string(self, node_id):
+    if node_id not in self.node_lookup:
+      return ''
+    return self.node_lookup[node_id]
 
 
+def create_graph():
+  """Creates a graph from saved GraphDef file and returns a saver."""
+  # Creates graph from saved graph_def.pb.
+  with tf.gfile.FastGFile(os.path.join(
+      FLAGS.model_dir, 'classify_image_graph_def.pb'), 'rb') as f:
+    graph_def = tf.GraphDef()
+    graph_def.ParseFromString(f.read())
+    _ = tf.import_graph_def(graph_def, name='')
 
 
-# 开启 Session 进行预测
-with tf.Session() as sess2:
-    tf.global_variables_initializer().run()
-    # 读入测试数据集并完成预处理
-    testdata = pd.read_csv(test_path).fillna(0)
-    testdata['Sex'] = testdata['Sex'].apply(lambda s: 1 if s == 'male' else 0)
-    X_test = testdata[['Sex', 'Age', 'Pclass', 'SibSp', 'Parch', 'Fare']]
-    # 加载模型存档
-    saver.restore(sess2, model_path)
-    # 正向传播计算
-    predictions = np.argmax(sess2.run(Y_pred, feed_dict={X: X_test}), 1)
+def run_inference_on_image(image):
+  """Runs inference on an image.
+  Args:
+    image: Image file name.
+  Returns:
+    Nothing
+  """
+  if not tf.gfile.Exists(image):
+    tf.logging.fatal('File does not exist %s', image)
+  image_data = tf.gfile.FastGFile(image, 'rb').read()
 
-# 构建提交结果的数据结构，并将结果存储为csv文件
-submission = pd.DataFrame({
-    "PassengerId": testdata["PassengerId"],
-    "Survived": predictions
-})
-submission.to_csv("/Users/sephiroth/Documents/ML_TensorFlow/titanic-submission.csv", index=False)
+  # Creates graph from saved GraphDef.
+  create_graph()
+
+  with tf.Session() as sess:
+    # Some useful tensors:
+    # 'softmax:0': A tensor containing the normalized prediction across
+    #   1000 labels.
+    # 'pool_3:0': A tensor containing the next-to-last layer containing 2048
+    #   float description of the image.
+    # 'DecodeJpeg/contents:0': A tensor containing a string providing JPEG
+    #   encoding of the image.
+    # Runs the softmax tensor by feeding the image_data as input to the graph.
+    softmax_tensor = sess.graph.get_tensor_by_name('softmax:0')
+    predictions = sess.run(softmax_tensor,
+                           {'DecodeJpeg/contents:0': image_data})
+    predictions = np.squeeze(predictions)
+
+    # Creates node ID --> English string lookup.
+    node_lookup = NodeLookup()
+
+    top_k = predictions.argsort()[-FLAGS.num_top_predictions:][::-1]
+    for node_id in top_k:
+      human_string = node_lookup.id_to_string(node_id)
+      score = predictions[node_id]
+      print('%s (score = %.5f)' % (human_string, score))
+
+
+def maybe_download_and_extract():
+  """Download and extract model tar file."""
+  dest_directory = FLAGS.model_dir
+  if not os.path.exists(dest_directory):
+    os.makedirs(dest_directory)
+  filename = DATA_URL.split('/')[-1]
+  filepath = os.path.join(dest_directory, filename)
+  if not os.path.exists(filepath):
+    def _progress(count, block_size, total_size):
+      sys.stdout.write('\r>> Downloading %s %.1f%%' % (
+          filename, float(count * block_size) / float(total_size) * 100.0))
+      sys.stdout.flush()
+    filepath, _ = urllib.request.urlretrieve(DATA_URL, filepath, _progress)
+    print()
+    statinfo = os.stat(filepath)
+    print('Successfully downloaded', filename, statinfo.st_size, 'bytes.')
+  tarfile.open(filepath, 'r:gz').extractall(dest_directory)
+
+
+def main(_):
+  maybe_download_and_extract()
+  image = (FLAGS.image_file if FLAGS.image_file else
+           os.path.join(FLAGS.model_dir, 'cropped_panda.jpg'))
+  run_inference_on_image(image)
+
+
+if __name__ == '__main__':
+  parser = argparse.ArgumentParser()
+  # classify_image_graph_def.pb:
+  #   Binary representation of the GraphDef protocol buffer.
+  # imagenet_synset_to_human_label_map.txt:
+  #   Map from synset ID to a human readable string.
+  # imagenet_2012_challenge_label_map_proto.pbtxt:
+  #   Text representation of a protocol buffer mapping a label to synset ID.
+  parser.add_argument(
+      '--model_dir',
+      type=str,
+      default='/tmp/imagenet',
+      help="""\
+      Path to classify_image_graph_def.pb,
+      imagenet_synset_to_human_label_map.txt, and
+      imagenet_2012_challenge_label_map_proto.pbtxt.\
+      """
+  )
+  parser.add_argument(
+      '--image_file',
+      type=str,
+      default='',
+      help='Absolute path to image file.'
+  )
+  parser.add_argument(
+      '--num_top_predictions',
+      type=int,
+      default=5,
+      help='Display this many predictions.'
+  )
+  FLAGS, unparsed = parser.parse_known_args()
+  tf.app.run(main=main, argv=[sys.argv[0]] + unparsed)
